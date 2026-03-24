@@ -6,51 +6,37 @@ import sys
 import pygame
 
 # ===========================================================================
-# TUNABLE PARAMETERS — adjust these to change robot behaviour
+# TUNABLE PARAMETERS — Algorithmic Navigation
 # ===========================================================================
 
-# -- Sensor --
-REVERSE_SENSOR_ORDER = True   # True = flip bit order (bit0↔bit4, bit1↔bit3)
+# -- Sensor Configuration --
+REVERSE_SENSOR_ORDER = False 
 
-# -- Speed limits (1-100 scale sent to ESP32) --
+# -- Algorithm Weights (W, NW, N, NE, E) --
+TURN_STRENGTHS = [-5.0, -3.0, 0.0, 3.0, 5.0]
+MOVE_STRENGTHS = [4.2, 4.6, 5.0, 4.6, 4.2]
+
+# -- Speed & Physics Limits --
 MIN_SPEED       = 5       # lowest usable motor speed
-MAX_SPEED       = 100     # highest motor speed
-DEFAULT_SPEED   = 50      # starting cruise speed (keys 1/2 adjust at runtime)
+MAX_SPEED       = 70     # highest motor speed
+DEFAULT_SPEED   = 25      # Base multiplier setting (Algorithm outputs 0-5. 5 * 10 = 50 motor speed)
 
-# -- Steering: [fast_side, slow_side] for each correction level --
-#    Positive = forward, 0 = stop, negative = reverse
-#    These are actual speed values (not ratios). The fast side gets this speed,
-#    the slow side gets the other. Left/right is mirrored automatically.
-STRAIGHT_SPEED    = 45    # both sides equal on a straight line
-GENTLE_FAST       = 35    # fast side speed during gentle correction
-GENTLE_SLOW       = 12    # slow side speed during gentle correction
-HARD_FAST         = 28    # fast side speed during hard correction
-HARD_SLOW         = -5    # slow side (negative = reverse for tighter turn)
-CURVE_FAST        = 25    # fast side speed during sharp 3-sensor curve
-CURVE_SLOW        = -12   # slow side reversed hard for sharp curves
-UNKNOWN_FAST      = 15    # both sides for unknown patterns
-UNKNOWN_SLOW      = 15
+ACCEL = 0.20  # Speed gained per tick
+DECEL = 0.12  # Speed lost per tick
+MAX_TURN_STRENGTH = 9.0 
 
-# -- Adaptive speed (how fast the robot ramps up on straights) --
-RAMP_UP_STEP      = 1     # speed increases by this each tick on straights
-
-# -- Recovery behaviour --
-LOST_LINE_TIMEOUT   = 0.5   # seconds of no reading before recovery starts
-RECOVERY_FWD_TIME   = 0.1   # seconds to creep forward during recovery
-RECOVERY_BACK_TIME  = 0.5   # seconds to reverse if still lost
-RECOVERY_SPEED      = 15    # speed during recovery creep/reverse
-
-# -- End condition (all 5 sensors = finish line) --
-END_COAST_TIME  = 0.5     # seconds to coast forward after all sensors trigger
-END_COAST_SPEED = 20      # speed during end coast
+# -- Recovery & Junction Parameters --
+RECOVERY_REVERSE_SPEED = 20
+RECOVERY_PIVOT_SPEED   = 18
+ENDPOINT_TARGET_SPEED  = 2.0  # Out of 5.0
 
 # -- UART --
 SERIAL_PORT     = '/dev/ttyAMA2'
 BAUD_RATE       = 115200
-PING_INTERVAL   = 5       # seconds between heartbeat pings
+PING_INTERVAL   = 5
 
 # ===========================================================================
-# Globals (not tunable)
+# Globals & State Machine
 # ===========================================================================
 running   = True
 auto_mode = False
@@ -58,22 +44,29 @@ auto_mode = False
 ir_status = 0
 ir_lock   = threading.Lock()
 
-current_speed = DEFAULT_SPEED
+current_speed = DEFAULT_SPEED # Acts as the master scalar for the 0-5 algorithmic speeds
 
-# Auto state machine
-STATE_FOLLOWING     = 0
-STATE_ENDING        = 1
-STATE_RECOVERY_FWD  = 2
-STATE_RECOVERY_BACK = 3
-STATE_STOPPED       = 4
+# FSM States
+STATE_FOLLOWING    = 0
+STATE_ENDPOINT     = 1
+STATE_LOST_REVERSE = 2
+STATE_LOST_PIVOT   = 3
+STATE_STOPPED      = 4
 
 auto_state     = STATE_FOLLOWING
-state_start    = 0.0
-adaptive_speed = DEFAULT_SPEED
-lost_since     = 0.0          # when we first saw no sensors (0 = not lost)
+internal_speed = 0.0 # Tracks the 0.0 to 5.0 algorithmic speed
+last_turn_var  = 0.0 # Memory for which way we were turning before getting lost
+
+STATE_NAMES = {
+    STATE_FOLLOWING:    "FOLLOW",
+    STATE_ENDPOINT:     "ENDPOINT",
+    STATE_LOST_REVERSE: "LOST_REV",
+    STATE_LOST_PIVOT:   "LOST_PIVOT",
+    STATE_STOPPED:      "STOPPED",
+}
 
 # ---------------------------------------------------------------------------
-# UART
+# UART & Movement Functions (Kept identical for hardware compatibility)
 # ---------------------------------------------------------------------------
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 
@@ -81,41 +74,18 @@ def sendSerialCommand(command_name, params):
     param_str   = ",".join(map(str, params))
     command_str = f"{command_name}:{param_str}\n"
     ser.write(command_str.encode())
-    print(f"Sent: {command_str.strip()}")
+
+def moveForward(speed): sendSerialCommand('mv_fwd', [speed])
+def moveReverse(speed): sendSerialCommand('mv_rev', [speed])
+def moveLeft(speed): sendSerialCommand('mv_left', [speed])
+def moveRight(speed): sendSerialCommand('mv_right', [speed])
+def moveTurnLeft(speed): sendSerialCommand('mv_turnleft', [speed])
+def moveTurnRight(speed): sendSerialCommand('mv_turnright', [speed])
+def stopAll(): sendSerialCommand('stop', [0])
+def moveCurve(left_speed, right_speed): sendSerialCommand('mv_curve', [left_speed, right_speed])
 
 # ---------------------------------------------------------------------------
-# Movement functions
-# ---------------------------------------------------------------------------
-def moveForward(speed):
-    sendSerialCommand('mv_fwd', [speed])
-
-def moveReverse(speed):
-    sendSerialCommand('mv_rev', [speed])
-
-def moveLeft(speed):
-    # STRAFE left (mecanum lateral) — manual A key only, NOT used in auto
-    sendSerialCommand('mv_left', [speed])
-
-def moveRight(speed):
-    # STRAFE right (mecanum lateral) — manual D key only, NOT used in auto
-    sendSerialCommand('mv_right', [speed])
-
-def moveTurnLeft(speed):
-    # TANK ROTATE CCW — both sides opposite — Q key + auto mode
-    sendSerialCommand('mv_turnleft', [speed])
-
-def moveTurnRight(speed):
-    # TANK ROTATE CW — both sides opposite — E key + auto mode
-    sendSerialCommand('mv_turnright', [speed])
-
-def stopAll():
-    sendSerialCommand('stop', [0])
-
-def moveCurve(left_speed, right_speed):
-    sendSerialCommand('mv_curve', [left_speed, right_speed])
-
-# ---------------------------------------------------------------------------
-# IR sensor helpers  (5-sensor arc on front semicircle)
+# IR Sensor Helpers
 #   Sensor output: 1 = black line detected, 0 = white / no line
 #
 #         [N]  North (center front)
@@ -130,11 +100,7 @@ def moveCurve(left_speed, right_speed):
 #   bit3 = GPIO15 = NE  (Northeast)
 #   bit4 = GPIO45 = E   (East / far right)
 # ---------------------------------------------------------------------------
-IDX_W  = 0
-IDX_NW = 1
-IDX_N  = 2
-IDX_NE = 3
-IDX_E  = 4
+IDX_W, IDX_NW, IDX_N, IDX_NE, IDX_E = 0, 1, 2, 3, 4
 
 def get_ir_bits():
     with ir_lock:
@@ -144,168 +110,135 @@ def get_ir_bits():
     return [(v >> i) & 1 for i in range(5)]
 
 # ---------------------------------------------------------------------------
-# FSM pattern sets (5 sensors — pattern bits: E(b4) NE(b3) N(b2) NW(b1) W(b0))
-# 1 = sees black line, 0 = sees white / no line
-# ---------------------------------------------------------------------------
-STRAIGHT_PATTERNS = {
-    0b00100,  # N only — perfectly centred
-    0b01110,  # NE+N+NW — wide line, centred
-    0b01010,  # NE+NW — symmetric, centred
-}
-
-GENTLE_LEFT_PATTERNS = {
-    0b00110,  # N+NW — line drifting left
-    0b00010,  # NW only
-}
-
-HARD_LEFT_PATTERNS = {
-    0b00001,  # W only — line far left
-    0b00011,  # NW+W
-}
-
-CURVE_LEFT_PATTERNS = {
-    0b00111,  # W+NW+N — sharp left curve (3 sensors)
-}
-
-GENTLE_RIGHT_PATTERNS = {
-    0b01100,  # NE+N — line drifting right
-    0b01000,  # NE only
-}
-
-HARD_RIGHT_PATTERNS = {
-    0b10000,  # E only — line far right
-    0b11000,  # NE+E
-}
-
-CURVE_RIGHT_PATTERNS = {
-    0b11100,  # N+NE+E — sharp right curve (3 sensors)
-}
-
-END_PATTERN = 0b11111  # all 5 sensors = finish line
-
-STATE_NAMES = {
-    STATE_FOLLOWING:     "FOLLOW",
-    STATE_ENDING:        "ENDING",
-    STATE_RECOVERY_FWD:  "RECOV_F",
-    STATE_RECOVERY_BACK: "RECOV_B",
-    STATE_STOPPED:       "STOPPED",
-}
-
-# ---------------------------------------------------------------------------
-# Line following FSM — smooth differential steering, adaptive speed
-# Uses moveCurve(left, right) instead of tank rotations for stability
+# ALGORITHMIC LINE FOLLOWING FSM
 # ---------------------------------------------------------------------------
 def line_follow_step():
-    global auto_state, state_start, adaptive_speed, lost_since
+    global auto_state, internal_speed, last_turn_var, current_speed
 
     bits = get_ir_bits()
-    w  = bits[IDX_W]
-    nw = bits[IDX_NW]
-    n  = bits[IDX_N]
-    ne = bits[IDX_NE]
-    e  = bits[IDX_E]
+    active_count = sum(bits)
+    pattern = (bits[IDX_E] << 4) | (bits[IDX_NE] << 3) | (bits[IDX_N] << 2) | (bits[IDX_NW] << 1) | bits[IDX_W]
+    
+    # Speed multiplier (maps 0.0-5.0 scale to actual motor speed)
+    multiplier = current_speed / 5.0 
 
-    pattern = (e << 4) | (ne << 3) | (n << 2) | (nw << 1) | w
-    now = time.monotonic()
-
-    cruise = max(MIN_SPEED, min(MAX_SPEED, current_speed))
-
-    # ---- STATE: ENDING ----
-    if auto_state == STATE_ENDING:
-        if now - state_start >= END_COAST_TIME:
-            stopAll()
-            auto_state = STATE_STOPPED
-        return
-
-    # ---- STATE: STOPPED ----
+    # 1. STATE: STOPPED / BRAKING
     if auto_state == STATE_STOPPED:
+        if internal_speed > 0:
+            # Gently ramp down the speed to prevent spilling
+            internal_speed = max(0.0, internal_speed - DECEL*5)
+            left_motor  = int(round(internal_speed * multiplier))
+            right_motor = int(round(internal_speed * multiplier))
+            moveCurve(left_motor, right_motor)
+        else:
+            stopAll() # Only lock motors once speed has gracefully reached 0
         return
 
-    # ---- STATE: RECOVERY FORWARD ----
-    if auto_state == STATE_RECOVERY_FWD:
-        if pattern != 0b00000:
-            auto_state = STATE_FOLLOWING
-            lost_since = 0.0
+    # 2. STATE: LOST - REVERSING TO FIND LINE
+    if auto_state == STATE_LOST_REVERSE:
+        if active_count > 0:
+            auto_state = STATE_LOST_PIVOT # Found a line, transition to Pivot
+        else:
+            moveCurve(-RECOVERY_REVERSE_SPEED, -RECOVERY_REVERSE_SPEED)
+        return
+
+    # 3. STATE: LOST - PIVOTING TO RECENTER
+    if auto_state == STATE_LOST_PIVOT:
+        # Calculate current turn strength to see if we are centered enough
+        if active_count > 0:
+            curr_turn_var = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active_count
+            if abs(curr_turn_var) <= 3.0:
+                auto_state = STATE_FOLLOWING
+                return
+        
+        # Pivot based on the memory of our last known direction
+        if last_turn_var > 0:
+            moveCurve(RECOVERY_PIVOT_SPEED, -RECOVERY_PIVOT_SPEED) # Pivot Right
+        else:
+            moveCurve(-RECOVERY_PIVOT_SPEED, RECOVERY_PIVOT_SPEED) # Pivot Left
+        return
+
+    # 4. STATE: ENDPOINT HANDLING
+    if auto_state == STATE_ENDPOINT:
+        target_max_speed = ENDPOINT_TARGET_SPEED
+        turn_var = 0.0 # Go straight through the endpoint/junction
+
+        # Check for End/Gate patterns (11011 or 10001)
+        if pattern == 0b11011 or pattern == 0b10001:
+            auto_state = STATE_STOPPED
+            print(">>> GATE DETECTED: HARD STOP")
             return
-        if now - state_start >= RECOVERY_FWD_TIME:
-            auto_state = STATE_RECOVERY_BACK
-            state_start = now
-            moveCurve(-RECOVERY_SPEED, -RECOVERY_SPEED)
-        return
-
-    # ---- STATE: RECOVERY BACK ----
-    if auto_state == STATE_RECOVERY_BACK:
-        if pattern != 0b00000:
+        
+        # If we crossed a junction and are back to a normal track (sum is 1, 2, or 3)
+        if 0 < active_count < 5 and pattern not in [0b11011, 0b10001]:
             auto_state = STATE_FOLLOWING
-            lost_since = 0.0
+            print(">>> ENDPOINT CLEARED")
             return
-        if now - state_start >= RECOVERY_BACK_TIME:
-            stopAll()
-            auto_state = STATE_FOLLOWING
-            lost_since = 0.0
-        return
 
-    # ---- STATE: FOLLOWING ----
+        # If we completely lose the line in a junction
+        if active_count == 0:
+            auto_state = STATE_LOST_REVERSE
+            return
 
-    # End condition — all 5 sensors
-    if pattern == END_PATTERN:
-        auto_state = STATE_ENDING
-        state_start = now
-        lost_since = 0.0
-        moveCurve(END_COAST_SPEED, END_COAST_SPEED)
-        print(">>> END LINE DETECTED")
-        return
+    # 5. STATE: NORMAL FOLLOWING (The Core Algorithm)
+    if auto_state == STATE_FOLLOWING:
+        if active_count == 0:
+            # We fell off the track. Save our last direction and trigger recovery.
+            auto_state = STATE_LOST_REVERSE
+            internal_speed = 0.0 # Instant loss of speed for safety
+            print(">>> LOST LINE: ENTERING RECOVERY")
+            return
 
-    # Lost line — debounced: must see nothing for LOST_LINE_TIMEOUT seconds
-    if pattern == 0b00000:
-        if lost_since == 0.0:
-            lost_since = now
-        if now - lost_since >= LOST_LINE_TIMEOUT:
-            auto_state = STATE_RECOVERY_FWD
-            state_start = now
-            moveCurve(RECOVERY_SPEED, RECOVERY_SPEED)
-            print(">>> LINE LOST — recovery started")
-        return
-    else:
-        lost_since = 0.0
+        elif active_count == 5:
+            # Hit a junction
+            auto_state = STATE_ENDPOINT
+            print(">>> ALL SENSORS ON: ENTERING ENDPOINT")
+            target_max_speed = ENDPOINT_TARGET_SPEED
+            turn_var = 0.0 
+        else:
+            # Normal Weighted Math
+            turn_var = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active_count
+            last_turn_var = turn_var # Save to memory
+            
+            if turn_var == 0.0:
+                target_max_speed = 5.0 # Dead straight
+            else:
+                target_max_speed = sum(b * m for b, m in zip(bits, MOVE_STRENGTHS)) / active_count
 
-    # Adaptive speed: ramp on straights, use tunable values on corrections
-    if pattern in STRAIGHT_PATTERNS:
-        adaptive_speed = min(cruise, adaptive_speed + RAMP_UP_STEP)
-        moveCurve(adaptive_speed, adaptive_speed)
+    # --- Shared Physics & Steering (Applies to Following & Junctions) ---
+    
+    # Apply Smooth Acceleration / Deceleration
+    if internal_speed < target_max_speed:
+        internal_speed = min(target_max_speed, internal_speed + ACCEL)
+    elif internal_speed > target_max_speed:
+        internal_speed = max(target_max_speed, internal_speed - DECEL)
 
-    elif pattern in GENTLE_LEFT_PATTERNS:
-        adaptive_speed = GENTLE_FAST
-        moveCurve(GENTLE_SLOW, GENTLE_FAST)
+    # Calculate Differential Steering
+    turn_ratio = abs(turn_var) / MAX_TURN_STRENGTH * 2
+    
+    # Delta V is the speed added to the fast wheel and subtracted from the slow wheel
+    delta_v = internal_speed * turn_ratio
 
-    elif pattern in HARD_LEFT_PATTERNS:
-        adaptive_speed = HARD_FAST
-        moveCurve(HARD_SLOW, HARD_FAST)
+    if turn_var > 0: # Turning Right
+        left_algo  = internal_speed + delta_v
+        right_algo = internal_speed - delta_v
+    elif turn_var < 0: # Turning Left
+        left_algo  = internal_speed - delta_v
+        right_algo = internal_speed + delta_v
+    else: # Straight
+        left_algo = right_algo = internal_speed
 
-    elif pattern in CURVE_LEFT_PATTERNS:
-        adaptive_speed = CURVE_FAST
-        moveCurve(CURVE_SLOW, CURVE_FAST)
+    # --- SAFETY CAP FOR MOTORS ---
+    # Because the outside wheel over-speeds to maintain center velocity, 
+    # we must ensure it doesn't try to exceed the physical MAX_SPEED (100).
+    left_motor  = max(-MAX_SPEED, min(MAX_SPEED, int(round(left_algo * multiplier))))
+    right_motor = max(-MAX_SPEED, min(MAX_SPEED, int(round(right_algo * multiplier))))
 
-    elif pattern in GENTLE_RIGHT_PATTERNS:
-        adaptive_speed = GENTLE_FAST
-        moveCurve(GENTLE_FAST, GENTLE_SLOW)
+    moveCurve(left_motor, right_motor)
 
-    elif pattern in HARD_RIGHT_PATTERNS:
-        adaptive_speed = HARD_FAST
-        moveCurve(HARD_FAST, HARD_SLOW)
-
-    elif pattern in CURVE_RIGHT_PATTERNS:
-        adaptive_speed = CURVE_FAST
-        moveCurve(CURVE_FAST, CURVE_SLOW)
-
-    else:
-        adaptive_speed = UNKNOWN_FAST
-        moveCurve(UNKNOWN_FAST, UNKNOWN_SLOW)
-
-    print(f"IR W={w} NW={nw} N={n} NE={ne} E={e} | pat={pattern:05b} | spd={adaptive_speed} | {STATE_NAMES[auto_state]}")
 
 # ---------------------------------------------------------------------------
-# UART receive + ping thread
+# UART Thread & Pygame Boilerplate
 # ---------------------------------------------------------------------------
 def uart_thread():
     global running, ir_status
@@ -317,32 +250,21 @@ def uart_thread():
             if text.startswith("IR_STATUS:"):
                 try:
                     _, value_str = text.split(":", 1)
-                    value = int(value_str) & 0x1F
                     with ir_lock:
-                        ir_status = value
-                    print(f"IR raw={value:05b}")
-                except ValueError:
-                    print(f"Bad IR_STATUS: {text}")
-            else:
-                print(f"UART: {text}")
+                        ir_status = int(value_str) & 0x1F
+                except ValueError: pass
 
         now = time.monotonic()
         if now - last_ping >= PING_INTERVAL:
-            ser.write(b"hello from raspberry pi\n")
+            ser.write(b"hello from pi\n")
             last_ping = now
 
-# ---------------------------------------------------------------------------
-# Ctrl+C handler
-# ---------------------------------------------------------------------------
 def handle_sigint(sig, frame):
     global running
     running = False
     stopAll()
     sys.exit(0)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_sigint)
 
@@ -351,51 +273,44 @@ if __name__ == "__main__":
 
     pygame.init()
     screen = pygame.display.set_mode((400, 300))
-    pygame.display.set_caption("Mecanum Line Follower")
+    pygame.display.set_caption("Algorithmic Line Follower")
     font = pygame.font.SysFont(None, 28)
 
-    pressed = {'w': False, 's': False, 'a': False,
-               'd': False, 'q': False, 'e': False}
-
-    print("M=toggle auto | W/S/A/D=manual | Q/E=turn | Space=stop | 1/2=speed | Esc=quit")
-    print(f"Speed: {current_speed}")
+    pressed = {'w': False, 's': False, 'a': False, 'd': False, 'q': False, 'e': False}
 
     def update_movement():
-        if auto_mode:
-            return
-        speed = max(MIN_SPEED, min(MAX_SPEED, current_speed))
-        if   pressed['w']: moveForward(speed)
-        elif pressed['s']: moveReverse(speed)
-        elif pressed['q']: moveTurnLeft(speed)     # Q = tank rotate left
-        elif pressed['e']: moveTurnRight(speed)    # E = tank rotate right
-        elif pressed['a']: moveLeft(speed)         # A = strafe left (manual only)
-        elif pressed['d']: moveRight(speed)        # D = strafe right (manual only)
+        if auto_mode: return
+        if   pressed['w']: moveForward(current_speed)
+        elif pressed['s']: moveReverse(current_speed)
+        elif pressed['q']: moveTurnLeft(current_speed)
+        elif pressed['e']: moveTurnRight(current_speed)
+        elif pressed['a']: moveLeft(current_speed)
+        elif pressed['d']: moveRight(current_speed)
         else:              stopAll()
 
     clock = pygame.time.Clock()
 
     while running:
-        # ---- HUD ----
         screen.fill((30, 30, 30))
         mode_color = (0, 220, 100) if auto_mode else (220, 180, 0)
-        mode_label = "AUTO  (line following)" if auto_mode else "MANUAL  (WASD+QE)"
+        mode_label = "AUTO (Algorithmic)" if auto_mode else "MANUAL (WASD+QE)"
+        
         bits = get_ir_bits()
-        pat  = (bits[IDX_E] << 4) | (bits[IDX_NE] << 3) | (bits[IDX_N] << 2) | (bits[IDX_NW] << 1) | bits[IDX_W]
+        active = sum(bits)
+        turn_display = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active if active > 0 else 0.0
 
-        screen.blit(font.render(f"MODE: {mode_label}",                         True, mode_color),    (20, 20))
-        screen.blit(font.render(f"Speed: {current_speed}  Adapt: {adaptive_speed}",  True, (200,200,200)), (20, 60))
-        screen.blit(font.render(f"W={bits[IDX_W]} NW={bits[IDX_NW]} N={bits[IDX_N]} NE={bits[IDX_NE]} E={bits[IDX_E]}", True, (100,180,255)), (20, 100))
-        screen.blit(font.render(f"Pattern: {pat:05b}  ({pat})",                True, (100,180,255)), (20, 135))
-        state_label = STATE_NAMES.get(auto_state, "?") if auto_mode else "-"
-        screen.blit(font.render(f"State: {state_label}",                       True, (180,220,180)), (20, 170))
-        screen.blit(font.render("M=auto  1/2=speed  Esc=quit",                 True, (120,120,120)), (20, 240))
+        screen.blit(font.render(f"MODE: {mode_label}", True, mode_color), (20, 20))
+        screen.blit(font.render(f"Max Speed Scalar: {current_speed}", True, (200,200,200)), (20, 60))
+        screen.blit(font.render(f"Internal Algo Spd: {internal_speed:.2f}", True, (200,200,200)), (20, 90))
+        screen.blit(font.render(f"W={bits[0]} NW={bits[1]} N={bits[2]} NE={bits[3]} E={bits[4]}", True, (100,180,255)), (20, 130))
+        screen.blit(font.render(f"Calc Turn Var: {turn_display:.2f}", True, (100,180,255)), (20, 160))
+        screen.blit(font.render(f"State: {STATE_NAMES.get(auto_state, '?')}", True, (180,220,180)), (20, 200))
+        
         pygame.display.flip()
 
-        # ---- Events ----
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_m:
                     auto_mode = not auto_mode
@@ -403,10 +318,7 @@ if __name__ == "__main__":
                     stopAll()
                     if auto_mode:
                         auto_state = STATE_FOLLOWING
-                        adaptive_speed = current_speed
-                        lost_since = 0.0
-                    print("AUTO ON" if auto_mode else "MANUAL")
-
+                        internal_speed = 0.0
                 elif event.key == pygame.K_w:      pressed['w'] = True;  update_movement()
                 elif event.key == pygame.K_s:      pressed['s'] = True;  update_movement()
                 elif event.key == pygame.K_a:      pressed['a'] = True;  update_movement()
@@ -415,14 +327,10 @@ if __name__ == "__main__":
                 elif event.key == pygame.K_e:      pressed['e'] = True;  update_movement()
                 elif event.key == pygame.K_SPACE:  pressed = {k: False for k in pressed}; stopAll()
                 elif event.key == pygame.K_ESCAPE: running = False
-
                 elif event.key == pygame.K_1:
-                    current_speed = max(MIN_SPEED, current_speed - 5)
-                    print(f"Speed -> {current_speed}");  update_movement()
+                    current_speed = max(MIN_SPEED, current_speed - 5); update_movement()
                 elif event.key == pygame.K_2:
-                    current_speed = min(MAX_SPEED, current_speed + 5)
-                    print(f"Speed -> {current_speed}");  update_movement()
-
+                    current_speed = min(MAX_SPEED, current_speed + 5); update_movement()
             elif event.type == pygame.KEYUP:
                 if   event.key == pygame.K_w: pressed['w'] = False; update_movement()
                 elif event.key == pygame.K_s: pressed['s'] = False; update_movement()
