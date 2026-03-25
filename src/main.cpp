@@ -143,6 +143,47 @@ void TURNRIGHT()
   MOTORD_BACKOFF(Motor_PWM);   // D (right rear)   = backward
 }
 
+// SIDE PIVOT — front wheels drive hard in opposite directions,
+// rear wheels crawl or stay still. Pivots around the rear axle center.
+// direction > 0 = pivot right, direction <= 0 = pivot left
+// rearFactor: 0-100 how much the rear wheels contribute (0 = still, 100 = same as front)
+//
+// Pivot RIGHT:
+//    ↑A-----B↓   (front wheels fast, opposite dirs)
+//     |      |
+//    ↑C-----D↓   (rear wheels slow or stopped)
+//
+// Pivot LEFT:
+//    ↓A-----B↑
+//     |      |
+//    ↓C-----D↑
+void SIDEPIVOT(int frontPwm, int rearPwm, int direction)
+{
+  if (direction > 0) {
+    // Pivot RIGHT: left side forward, right side backward
+    MOTORA_FORWARD(frontPwm);    // A (left front) = forward fast
+    MOTORB_BACKOFF(frontPwm);    // B (right front) = backward fast
+    if (rearPwm > 0) {
+      MOTORC_FORWARD(rearPwm);   // C (left rear) = forward slow
+      MOTORD_BACKOFF(rearPwm);   // D (right rear) = backward slow
+    } else {
+      MOTORC_STOP(0);
+      MOTORD_STOP(0);
+    }
+  } else {
+    // Pivot LEFT: left side backward, right side forward
+    MOTORA_BACKOFF(frontPwm);    // A (left front) = backward fast
+    MOTORB_FORWARD(frontPwm);    // B (right front) = forward fast
+    if (rearPwm > 0) {
+      MOTORC_BACKOFF(rearPwm);   // C (left rear) = backward slow
+      MOTORD_FORWARD(rearPwm);   // D (right rear) = forward slow
+    } else {
+      MOTORC_STOP(0);
+      MOTORD_STOP(0);
+    }
+  }
+}
+
 //    =A-----B=  
 //     |  =  |
 //    =C-----D=
@@ -259,6 +300,17 @@ void turnright(int speed)
   if (Motor_PWM == 0) { STOP(); } else { TURNRIGHT(); }
 }
 
+// Side pivot — front wheels oppose at high speed, rear crawl or stop
+// direction: 1 = right, -1 = left
+// rearPercent: 0-100 how much rear wheels contribute
+void sidepivot(int frontSpeed, int rearPercent, int direction)
+{
+  int fp = speedToPwm(abs(frontSpeed));
+  int rp = (rearPercent > 0) ? speedToPwm(abs(frontSpeed) * rearPercent / 100) : 0;
+  if (fp == 0) { STOP(); return; }
+  SIDEPIVOT(fp, rp, direction);
+}
+
 // Differential steering — used by auto mode for smooth curves
 // Each side can have independent speed; negative = reverse
 void curve(int leftSpeed, int rightSpeed)
@@ -317,6 +369,16 @@ void handleCommand(const String& commandName, const String& paramsStr)
     turnleft(speed);                 // TANK ROTATE (Q key) — both sides opposite
   } else if (commandName == "mv_turnright") {
     turnright(speed);                // TANK ROTATE (E key) — both sides opposite
+  } else if (commandName == "mv_sidepivot") {
+    // Format: mv_sidepivot:frontSpeed,rearPercent,direction
+    int c1 = paramsStr.indexOf(',');
+    int c2 = paramsStr.indexOf(',', c1 + 1);
+    if (c1 != -1 && c2 != -1) {
+      int fs = paramsStr.substring(0, c1).toInt();
+      int rp = paramsStr.substring(c1 + 1, c2).toInt();
+      int dir = paramsStr.substring(c2 + 1).toInt();
+      sidepivot(fs, rp, dir);
+    }
   } else if (commandName == "mv_curve") {
     int ci = paramsStr.indexOf(',');
     if (ci != -1) {
