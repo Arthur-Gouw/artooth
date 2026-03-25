@@ -11,19 +11,25 @@ import pygame
 
 # -- Sensor Configuration --
 REVERSE_SENSOR_ORDER = False 
+LOST_DETECTION_DELAY = 0.5
+LOST_DETECTION_FRAMES = 0
 
 # -- Algorithm Weights (W, NW, N, NE, E) --
-TURN_STRENGTHS = [-5.0, -3.0, 0.0, 3.0, 5.0]
-MOVE_STRENGTHS = [4.2, 4.6, 5.0, 4.6, 4.2]
+TURN_STRENGTHS = [-7, -4.5, 0.0, 4.5, 7]
+MOVE_STRENGTHS = [3.8, 4.6, 5.0, 4.6, 3.8]
 
 # -- Speed & Physics Limits --
-MIN_SPEED       = 5       # lowest usable motor speed
-MAX_SPEED       = 70     # highest motor speed
-DEFAULT_SPEED   = 25      # Base multiplier setting (Algorithm outputs 0-5. 5 * 10 = 50 motor speed)
+MIN_SPEED       = 10       # lowest usable motor speed
+MAX_SPEED       = 120     # highest motor speed
+DEFAULT_SPEED   = 35      # Base multiplier setting (Algorithm outputs 0-5. 5 * 10 = 50 motor speed)
 
 ACCEL = 0.20  # Speed gained per tick
 DECEL = 0.12  # Speed lost per tick
 MAX_TURN_STRENGTH = 9.0 
+
+# Add a rate limiter
+last_control_time = 0
+CONTROL_INTERVAL = 0.033  # 30 Hz instead of 60 Hz
 
 # -- Recovery & Junction Parameters --
 RECOVERY_REVERSE_SPEED = 20
@@ -56,6 +62,7 @@ STATE_STOPPED      = 4
 auto_state     = STATE_FOLLOWING
 internal_speed = 0.0 # Tracks the 0.0 to 5.0 algorithmic speed
 last_turn_var  = 0.0 # Memory for which way we were turning before getting lost
+turn_var = 0.0
 
 STATE_NAMES = {
     STATE_FOLLOWING:    "FOLLOW",
@@ -113,7 +120,14 @@ def get_ir_bits():
 # ALGORITHMIC LINE FOLLOWING FSM
 # ---------------------------------------------------------------------------
 def line_follow_step():
-    global auto_state, internal_speed, last_turn_var, current_speed
+    global auto_state, internal_speed, last_turn_var, current_speed, turn_var
+    global lost_frame_counter
+    global last_control_time
+
+    current_time = time.time()
+    if current_time - last_control_time < CONTROL_INTERVAL:
+        return
+    last_control_time = current_time
 
     bits = get_ir_bits()
     active_count = sum(bits)
@@ -137,7 +151,8 @@ def line_follow_step():
     # 2. STATE: LOST - REVERSING TO FIND LINE
     if auto_state == STATE_LOST_REVERSE:
         if active_count > 0:
-            auto_state = STATE_LOST_PIVOT # Found a line, transition to Pivot
+            auto_state = STATE_LOST_PIVOT
+            lost_frame_counter = 0  # Reset counter
         else:
             moveCurve(-RECOVERY_REVERSE_SPEED, -RECOVERY_REVERSE_SPEED)
         return
@@ -149,6 +164,7 @@ def line_follow_step():
             curr_turn_var = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active_count
             if abs(curr_turn_var) <= 3.0:
                 auto_state = STATE_FOLLOWING
+                lost_frame_counter = 0 
                 return
         
         # Pivot based on the memory of our last known direction
@@ -164,7 +180,7 @@ def line_follow_step():
         turn_var = 0.0 # Go straight through the endpoint/junction
 
         # Check for End/Gate patterns (11011 or 10001)
-        if pattern == 0b11011 or pattern == 0b10001:
+        if internal_speed == ENDPOINT_TARGET_SPEED and (pattern == 0b11011 or pattern == 0b10001):
             auto_state = STATE_STOPPED
             print(">>> GATE DETECTED: HARD STOP")
             return
@@ -180,28 +196,45 @@ def line_follow_step():
             auto_state = STATE_LOST_REVERSE
             return
 
-    # 5. STATE: NORMAL FOLLOWING (The Core Algorithm)
+    # 5. STATE: NORMAL FOLLOWING (Modified with debounce)
     if auto_state == STATE_FOLLOWING:
         if active_count == 0:
-            # We fell off the track. Save our last direction and trigger recovery.
-            auto_state = STATE_LOST_REVERSE
-            internal_speed = 0.0 # Instant loss of speed for safety
-            print(">>> LOST LINE: ENTERING RECOVERY")
-            return
-
-        elif active_count == 5:
-            # Hit a junction
+            # Increment lost frame counter
+            lost_frame_counter += 1
+            
+            # Only declare lost if we've had NO line for LOST_DETECTION_DELAY seconds
+            if lost_frame_counter >= (LOST_DETECTION_DELAY * 60):  # 60 Hz update rate
+                auto_state = STATE_LOST_REVERSE
+                internal_speed = 0.0
+                print(f">>> LOST LINE: ENTERING RECOVERY after {lost_frame_counter} frames")
+                lost_frame_counter = 0
+            else:
+                # Still waiting to declare lost - maintain last command or gradually slow
+                print(f"Lost frame {lost_frame_counter}/{int(LOST_DETECTION_DELAY*60)}")
+                # Optionally slow down while waiting
+                internal_speed = max(0.0, internal_speed - DECEL)
+                # Maintain last turn direction to keep trying to find line
+                if last_turn_var > 0:
+                    moveCurve(int(internal_speed * multiplier), -int(internal_speed * multiplier))
+                else:
+                    moveCurve(-int(internal_speed * multiplier), int(internal_speed * multiplier))
+                return
+        else:
+            # Reset counter when we see line again
+            lost_frame_counter = 0
+            
+        # Continue with normal following logic if we have line
+        if active_count == 5:
             auto_state = STATE_ENDPOINT
             print(">>> ALL SENSORS ON: ENTERING ENDPOINT")
             target_max_speed = ENDPOINT_TARGET_SPEED
             turn_var = 0.0 
         else:
-            # Normal Weighted Math
             turn_var = sum(b * t for b, t in zip(bits, TURN_STRENGTHS)) / active_count
-            last_turn_var = turn_var # Save to memory
+            last_turn_var = turn_var
             
             if turn_var == 0.0:
-                target_max_speed = 5.0 # Dead straight
+                target_max_speed = 5.0
             else:
                 target_max_speed = sum(b * m for b, m in zip(bits, MOVE_STRENGTHS)) / active_count
 
@@ -220,11 +253,11 @@ def line_follow_step():
     delta_v = internal_speed * turn_ratio
 
     if turn_var > 0: # Turning Right
-        left_algo  = internal_speed + delta_v
+        left_algo  = (internal_speed + delta_v) * 1.3
         right_algo = internal_speed - delta_v
     elif turn_var < 0: # Turning Left
         left_algo  = internal_speed - delta_v
-        right_algo = internal_speed + delta_v
+        right_algo = (internal_speed + delta_v) * 1.3
     else: # Straight
         left_algo = right_algo = internal_speed
 
@@ -302,9 +335,10 @@ if __name__ == "__main__":
         screen.blit(font.render(f"MODE: {mode_label}", True, mode_color), (20, 20))
         screen.blit(font.render(f"Max Speed Scalar: {current_speed}", True, (200,200,200)), (20, 60))
         screen.blit(font.render(f"Internal Algo Spd: {internal_speed:.2f}", True, (200,200,200)), (20, 90))
-        screen.blit(font.render(f"W={bits[0]} NW={bits[1]} N={bits[2]} NE={bits[3]} E={bits[4]}", True, (100,180,255)), (20, 130))
-        screen.blit(font.render(f"Calc Turn Var: {turn_display:.2f}", True, (100,180,255)), (20, 160))
-        screen.blit(font.render(f"State: {STATE_NAMES.get(auto_state, '?')}", True, (180,220,180)), (20, 200))
+        screen.blit(font.render(f"Turn Strength: {(turn_var / MAX_TURN_STRENGTH * 2) if turn_var != 0 else 0:.2f}", True, (200,200,200)), (20, 120))
+        screen.blit(font.render(f"W={bits[0]} NW={bits[1]} N={bits[2]} NE={bits[3]} E={bits[4]}", True, (100,180,255)), (20, 160))
+        screen.blit(font.render(f"Calc Turn Var: {turn_display:.2f}", True, (100,180,255)), (20, 190))
+        screen.blit(font.render(f"State: {STATE_NAMES.get(auto_state, '?')}", True, (180,220,180)), (20, 230))
         
         pygame.display.flip()
 
