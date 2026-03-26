@@ -35,9 +35,9 @@ ENDPOINT_TARGET_SPEED  = 2.0   # Out of 5.0
 # -- Pseudo-distance threshold (speed_units × seconds, no encoder) --
 # Represents the estimated "distance travelled" while reversing before
 # escalating to the pivot state. Tune to match your physical track width.
-REVERSE_PSEUDO_DIST_MAX = 1.8   # How far to reverse before switching to pivot
-ENDPOINT_PSEUDO_DIST_MAX = 5
-LOST_PSEUDO_DIST_MAX = 1.5
+REVERSE_PSEUDO_DIST_MAX = 0.18   # How far to reverse before switching to pivot
+ENDPOINT_PSEUDO_DIST_MAX = 0.45
+LOST_PSEUDO_DIST_MAX = 0.15
 
 # -- UART --
 SERIAL_PORT     = '/dev/ttyAMA2'
